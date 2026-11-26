@@ -930,3 +930,18 @@ body.pane-dragging iframe, body.pane-dragging .msgs { pointer-events: none; }
 /* 下载准备中：进度条流动，表示正在连接 */
 .bar.dl-starting i { background: linear-gradient(90deg, transparent 0 30%, var(--clay) 50%, transparent 70% 100%); background-size: 250% 100%; animation: stepflow 1.4s linear infinite; opacity: .7; }
 @media (prefers-reduced-motion: reduce) { .bar.dl-starting i { animation: none; } }
+
+/* 浏览器预览：只在 preview.js 启用时出现 */
+body.ono-preview #app { height: calc(100vh - 42px); margin-top: 42px; }
+.ono-preview-bar { position: fixed; inset: 0 0 auto; z-index: 100; height: 42px; display: flex; align-items: center; gap: 14px; padding: 0 16px; background: var(--clay-soft); color: var(--clay-ink); border-bottom: 1px solid var(--line-2); font-size: 12px; }
+.ono-preview-bar span { opacity: .82; }
+.ono-preview-bar button { margin-left: auto; border: 1px solid currentColor; border-radius: 7px; padding: 5px 10px; background: var(--card); color: inherit; font: inherit; cursor: pointer; }
+.ono-preview-panel { position: fixed; right: 14px; bottom: 14px; z-index: 101; width: min(440px, calc(100vw - 28px)); max-height: min(70vh, 640px); overflow: auto; padding: 14px; border: 1px solid var(--line-2); border-radius: 12px; background: var(--card); color: var(--text); box-shadow: 0 16px 48px rgba(0,0,0,.22); font-family: var(--sans); }
+.ono-preview-head { display: flex; align-items: center; justify-content: space-between; }
+.ono-preview-head button { width: 28px; height: 28px; border: 0; border-radius: 6px; background: transparent; color: var(--text-2); font-size: 20px; cursor: pointer; }
+.ono-preview-panel p, .ono-preview-panel small { color: var(--text-3); line-height: 1.6; }
+.ono-preview-panel ol { margin: 10px 0 0; padding-left: 22px; }
+.ono-preview-panel li { margin: 7px 0; line-height: 1.5; }
+.ono-preview-panel li.ok { color: #2E9E6B; }
+.ono-preview-panel li.failed { color: #D0453A; }
+@media (max-width: 680px) { .ono-preview-bar span { display: none; } }

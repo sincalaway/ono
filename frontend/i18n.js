@@ -150,7 +150,7 @@
   window.tr = tr;
 
   // ---------------------------------------------------------------- 页面
-  const SKIP = '[data-noi18n],.m-user,.md-body,.think>div,.cm-prompt>div,.sum-bar>div,pre,code,textarea,script,style,iframe,.ci>span,.img-p';
+  const SKIP = '[data-noi18n],.m-user,.md-body,.think>div,.cm-prompt>div,.sum-bar>div,pre,code,textarea,script,style,iframe,.ci>span,.img-p,.lastlog,.logs';
   const ATTRS = ['placeholder', 'title', 'aria-label', 'alt'];
   const doneText = new WeakMap();
   const doneAttr = new WeakMap();

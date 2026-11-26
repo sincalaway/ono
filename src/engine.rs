@@ -3,6 +3,7 @@ use reqwest::blocking::Client;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::VecDeque,
     env, fs,
     io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
@@ -10,6 +11,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
         LazyLock, Mutex,
     },
     thread,
@@ -17,14 +19,51 @@ use std::{
 };
 use tauri::{AppHandle, Emitter};
 
+const LOG_TAIL_LINES: usize = 120;
+
+#[derive(Default)]
+struct EngineLog {
+    lines: VecDeque<String>,
+    last_log: String,
+    gpu_error: bool,
+}
+
+impl EngineLog {
+    fn push(&mut self, line: String) {
+        let lower = line.to_ascii_lowercase();
+        self.gpu_error |= [
+            "cuda error",
+            "metal error",
+            "vulkan error",
+            "out of device memory",
+            "ggml_cuda_error",
+        ]
+        .iter()
+        .any(|s| lower.contains(s));
+        self.last_log = line.chars().take(4096).collect();
+        self.lines.push_back(self.last_log.clone());
+        while self.lines.len() > LOG_TAIL_LINES {
+            self.lines.pop_front();
+        }
+    }
+
+    fn text(&self) -> String {
+        if self.lines.is_empty() {
+            "引擎没有输出错误日志".into()
+        } else {
+            self.lines.iter().cloned().collect::<Vec<_>>().join("\n")
+        }
+    }
+}
+
 struct Running {
     child: Child,
     path: String,
     port: u16,
     ready: bool,
     since: Instant,
-    last_log: String,
-    gpu_error: bool,
+    log: EngineLog,
+    log_rx: Receiver<String>,
 }
 #[derive(Default)]
 struct Service {
@@ -237,45 +276,135 @@ pub fn pid() -> Option<u32> {
         .as_ref()
         .map(|r| r.child.id())
 }
-fn log_pipe(pipe: impl Read + Send + 'static, app: AppHandle, pid: u32) {
+fn log_pipe(pipe: impl Read + Send + 'static, tx: mpsc::Sender<String>) {
     thread::spawn(move || {
         for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+fn collect_logs(r: &mut Running, wait: bool) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_millis(if wait { 500 } else { 0 });
+    let mut pending = Vec::new();
+    loop {
+        match r.log_rx.try_recv() {
+            Ok(line) => {
+                r.log.push(line.clone());
+                pending.push(line);
+            }
+            Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) if !wait || Instant::now() >= deadline => break,
+            Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    pending
+}
+
+fn vision_load_failed(log: &str) -> bool {
+    log.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        let component = ["mmproj", "projector", "vision model", "clip model"]
+            .iter()
+            .any(|s| lower.contains(s));
+        component
+            && ["error", "failed", "invalid", "not found", "mismatch"]
+                .iter()
+                .any(|s| lower.contains(s))
+    })
+}
+
+fn load_failure_hint(log: &str) -> String {
+    let lower = log.to_ascii_lowercase();
+    if [
+        "unknown model architecture",
+        "unknown architecture",
+        "unsupported model",
+        "unsupported architecture",
+    ]
+    .iter()
+    .any(|s| lower.contains(s))
+    {
+        "原因：当前推理引擎不支持这个模型架构。请更新或重新导入较新的 llama.cpp 引擎。".into()
+    } else if vision_load_failed(log) {
+        "原因：看图组件加载失败，可能与当前模型不配套。可尝试不带看图组件重新加载。".into()
+    } else if [
+        "out of memory",
+        "out of device memory",
+        "cuda error",
+        "vulkan error",
+        "failed to allocate",
+    ]
+    .iter()
+    .any(|s| lower.contains(s))
+    {
+        "原因：内存或显存不足。可关闭占显存的程序、调小上下文，或点击「本次改用 CPU 重试」。".into()
+    } else if [
+        "invalid magic",
+        "invalid gguf",
+        "failed to load model",
+        "error loading model",
+        "tensor data not found",
+    ]
+    .iter()
+    .any(|s| lower.contains(s))
+    {
+        "原因：模型文件可能损坏、量化格式过新或分卷不完整。请重新下载或导入，并确认所有分卷在同一目录。".into()
+    } else if [
+        "unknown argument",
+        "unrecognized option",
+        "invalid argument",
+    ]
+    .iter()
+    .any(|s| lower.contains(s))
+    {
+        "原因：启动参数与当前引擎不匹配。请在「高级：启动参数」清空自定义参数后重试。".into()
+    } else {
+        "原因：引擎在读取模型时退出。请查看下方完整日志中第一条 error 或 failed；刚下载的模型可尝试更新推理引擎或重新下载。".into()
+    }
+}
+
+fn monitor(pid: u32, app: AppHandle) {
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_millis(500));
+        let mut pending: Vec<String>;
+        let crash = {
             let mut s = SERVICE.lock().unwrap();
             let Some(r) = s.running.as_mut().filter(|r| r.child.id() == pid) else {
                 break;
             };
-            let lower = line.to_ascii_lowercase();
-            r.gpu_error |= [
-                "cuda error",
-                "metal error",
-                "vulkan error",
-                "out of device memory",
-                "ggml_cuda_error",
-            ]
-            .iter()
-            .any(|s| lower.contains(s));
-            r.last_log = line.clone();
-            drop(s);
+            pending = collect_logs(r, false);
+            let exit = match r.child.try_wait() {
+                Ok(Some(exit)) => Some(exit),
+                _ => None,
+            };
+            let crash = if let Some(exit) = exit {
+                pending.extend(collect_logs(r, true));
+                let crash = json!({
+                    "model_path":r.path,
+                    "gpu_error":r.log.gpu_error,
+                    "exit_code":exit.code(),
+                    "logs":r.log.lines,
+                    "message":format!("llama-server {exit}\n\n{}",r.log.text())
+                });
+                s.crash = crash.clone();
+                s.running = None;
+                Some(crash)
+            } else {
+                None
+            };
+            crash
+        };
+        for line in pending {
             let _ = app.emit("server-log", line);
         }
-    });
-}
-fn monitor(pid: u32, app: AppHandle) {
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_millis(500));
-        let mut s = SERVICE.lock().unwrap();
-        let Some(r) = s.running.as_mut().filter(|r| r.child.id() == pid) else {
-            break;
-        };
-        let Ok(Some(exit)) = r.child.try_wait() else {
+        let Some(crash) = crash else {
             continue;
         };
-        s.crash = json!({"model_path":r.path,"gpu_error":r.gpu_error,"message":format!("llama-server {exit}\n{}",r.last_log)});
-        s.running = None;
-        let crash = s.crash.clone();
-        let st = status(&s);
-        drop(s);
-        let _ = app.emit("server-status", st);
+        let s = SERVICE.lock().unwrap();
+        let _ = app.emit("server-status", status(&s));
         let _ = app.emit("server-crashed", crash);
         break;
     });
@@ -310,7 +439,23 @@ pub fn launch_args(
     mmproj: Option<&str>,
     custom_args: &str,
 ) -> Result<Vec<String>, String> {
-    let (extra, _) = custom(custom_args)?;
+    let (mut extra, _) = custom(custom_args)?;
+    if cfg["engine_cpu"] == true {
+        let mut cpu_args = Vec::new();
+        let mut tokens = std::mem::take(&mut extra).into_iter();
+        while let Some(token) = tokens.next() {
+            let gpu_flag = ["-ngl", "--gpu-layers", "--n-gpu-layers", "-dev", "--device"]
+                .contains(&token.split('=').next().unwrap());
+            if gpu_flag {
+                if !token.contains('=') {
+                    let _ = tokens.next();
+                }
+            } else {
+                cpu_args.push(token);
+            }
+        }
+        extra = cpu_args;
+    }
     let has = |names: &[&str]| {
         extra
             .iter()
@@ -378,7 +523,10 @@ fn start(ctx: &Ctx, app: &AppHandle, a: &Value) -> Reply {
     let path = a["path"].as_str().ok_or("缺少模型路径")?;
     let model = crate::models::lookup(ctx, path)?;
     let exe = executable(ctx).ok_or("尚未安装 llama.cpp，请先安装或导入引擎")?;
-    let cfg = ctx.settings()?;
+    let mut cfg = ctx.settings()?;
+    if a["cpu"].as_bool().unwrap_or(false) {
+        cfg["engine_cpu"] = Value::Bool(true);
+    }
     let preferred = cfg["port"].as_u64().unwrap_or(8686) as u16;
     let levels = ctx.read("safe_levels", json!({}))?;
     let level = a["safe"]
@@ -428,20 +576,21 @@ fn start(ctx: &Ctx, app: &AppHandle, a: &Value) -> Reply {
     let id = child.id();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
+    let (log_tx, log_rx) = mpsc::channel();
+    log_pipe(stdout, log_tx.clone());
+    log_pipe(stderr, log_tx);
     s.running = Some(Running {
         child,
         path: path.into(),
         port,
         ready: false,
         since: Instant::now(),
-        last_log: String::new(),
-        gpu_error: false,
+        log: EngineLog::default(),
+        log_rx,
     });
     s.crash = Value::Null;
     let _ = app.emit("server-status", status(&s));
     drop(s);
-    log_pipe(stdout, app.clone(), id);
-    log_pipe(stderr, app.clone(), id);
     let http = Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(2))
@@ -454,39 +603,80 @@ fn start(ctx: &Ctx, app: &AppHandle, a: &Value) -> Reply {
             .send()
             .is_ok_and(|r| r.status().is_success());
         let mut s = SERVICE.lock().unwrap();
-        let r = s
-            .running
-            .as_mut()
-            .filter(|r| r.child.id() == id)
-            .ok_or("模型启动已取消")?;
+        let Some(r) = s.running.as_mut().filter(|r| r.child.id() == id) else {
+            drop(s);
+            return Err("模型启动已取消".into());
+        };
+        let mut pending = collect_logs(r, false);
         if let Some(exit) = r.child.try_wait().map_err(|e| e.to_string())? {
-            let err = format!("加载模型失败（{exit}）：{}", r.last_log);
-            s.crash = json!({"message":err,"model_path":path,"gpu_error":r.gpu_error});
+            pending.extend(collect_logs(r, true));
+            let log = r.log.text();
+            let err = format!(
+                "加载模型失败（{exit}）\n模型：{path}\n{}\n\n引擎日志：\n{}",
+                load_failure_hint(&log),
+                log
+            );
+            let retry_without_vision = mm.is_some() && level < 4 && vision_load_failed(&log);
+            s.crash = json!({
+                "message":err,
+                "model_path":path,
+                "gpu_error":r.log.gpu_error,
+                "exit_code":exit.code(),
+                "logs":r.log.lines
+            });
             s.running = None;
-            let _ = app.emit("server-status", status(&s));
+            let st = status(&s);
+            drop(s);
+            for line in pending {
+                let _ = app.emit("server-log", line);
+            }
+            let _ = app.emit("server-status", st);
+            if retry_without_vision {
+                let _ = app.emit(
+                    "server-note",
+                    "[启动器] 看图组件加载失败，正在不带看图组件重新加载…",
+                );
+                let mut retry = a.clone();
+                retry["safe"] = json!(4);
+                return start(ctx, app, &retry);
+            }
             return Err(err);
         }
         if healthy {
             r.ready = true;
-            let _ = app.emit("server-status", status(&s));
+            let st = status(&s);
             drop(s);
+            for line in pending {
+                let _ = app.emit("server-log", line);
+            }
+            let _ = app.emit("server-status", st);
             monitor(id, app.clone());
             ctx.update("safe_levels", json!({}), |v| {
                 v[path] = json!(level);
                 Ok(())
             })?;
             return Ok(
-                json!({"ctx":len,"safe_level":level,"vision":mm.is_some(),"model_repo":model["repo"],"vision_off":if mm.is_some(){Value::Null}else if model["mmproj"].is_string(){json!("safe")}else{json!("none")}}),
+                json!({"ctx":len,"safe_level":level,"vision":mm.is_some(),"model_repo":model["repo"],"vision_off":if mm.is_some(){Value::Null}else if model["mmproj"].is_string(){json!("safe")}else{json!("none")},"cpu":cfg["engine_cpu"] == true}),
             );
         }
         if Instant::now() >= until {
             let _ = r.child.kill();
             let _ = r.child.wait();
+            pending.extend(collect_logs(r, true));
+            let log = r.log.text();
             s.running = None;
-            let _ = app.emit("server-status", status(&s));
-            return Err("引擎加载超时".into());
+            let st = status(&s);
+            drop(s);
+            for line in pending {
+                let _ = app.emit("server-log", line);
+            }
+            let _ = app.emit("server-status", st);
+            return Err(format!("引擎加载超时\n\n引擎日志：\n{log}"));
         }
         drop(s);
+        for line in pending {
+            let _ = app.emit("server-log", line);
+        }
         thread::sleep(Duration::from_millis(200));
     }
 }
@@ -559,13 +749,23 @@ pub fn handle(cmd: &str, a: &Value, ctx: &Ctx, app: &AppHandle) -> Option<Reply>
         }
         "last_crash" => Ok(SERVICE.lock().unwrap().crash.clone()),
         "load_progress" => {
-            let s = SERVICE.lock().unwrap();
-            Ok(match &s.running {
-                Some(r) => {
-                    json!({"running":true,"stage":if r.ready{"已就绪"}else{"读取模型权重"},"fraction":-1,"elapsed_s":r.since.elapsed().as_secs(),"last_log":r.last_log})
+            let (reply, pending) = {
+                let mut s = SERVICE.lock().unwrap();
+                match s.running.as_mut() {
+                    Some(r) => {
+                        let pending = collect_logs(r, false);
+                        (
+                            json!({"running":true,"stage":if r.ready{"已就绪"}else{"读取模型权重"},"fraction":-1,"elapsed_s":r.since.elapsed().as_secs(),"last_log":r.log.last_log}),
+                            pending,
+                        )
+                    }
+                    None => (json!({"running":false}), Vec::new()),
                 }
-                None => json!({"running":false}),
-            })
+            };
+            for line in pending {
+                let _ = app.emit("server-log", line);
+            }
+            Ok(reply)
         }
         "engine_check" => check_engine(ctx),
         "set_custom_args" => save_args(ctx, a),
@@ -581,6 +781,61 @@ mod tests {
         let value = json!({"model_name": model_name(r"C:\models\Qwen3-4B-Q4_K_M.gguf")});
         assert_eq!(value["model_name"], "Qwen3-4B-Q4_K_M");
         assert!(value["model_name"].is_string());
+    }
+
+    #[test]
+    fn engine_log_keeps_diagnostic_tail_and_gpu_errors() {
+        let mut log = EngineLog::default();
+        for i in 0..125 {
+            log.push(format!("engine line {i}"));
+        }
+        assert_eq!(log.lines.len(), LOG_TAIL_LINES);
+        assert_eq!(log.lines.front().unwrap(), "engine line 5");
+        assert_eq!(log.last_log, "engine line 124");
+        assert!(!log.gpu_error);
+        log.push("ggml_cuda: CUDA error: out of device memory".into());
+        assert!(log.gpu_error);
+        assert!(log.text().contains("out of device memory"));
+        log.push("x".repeat(5000));
+        assert_eq!(log.last_log.chars().count(), 4096);
+        assert_eq!(log.lines.len(), LOG_TAIL_LINES);
+    }
+
+    #[test]
+    fn load_failure_hints_identify_actionable_causes() {
+        assert!(load_failure_hint("unknown architecture: future_model").contains("不支持"));
+        assert!(load_failure_hint("ggml_cuda: out of memory").contains("显存不足"));
+        assert!(load_failure_hint("invalid magic in GGUF").contains("分卷不完整"));
+        assert!(load_failure_hint("unknown argument: --future").contains("启动参数"));
+        assert!(
+            load_failure_hint("llava_projector_load: error loading vision file")
+                .contains("看图组件")
+        );
+        assert!(!vision_load_failed(
+            "main: model loaded with --mmproj vision.gguf"
+        ));
+        assert!(vision_load_failed("mmproj: failed to load projector"));
+    }
+
+    #[test]
+    fn cpu_override_replaces_custom_gpu_arguments() {
+        let args = launch_args(
+            &json!({"engine_cpu":true,"gpu_devices":["0"]}),
+            "/tmp/model.gguf",
+            4096,
+            9000,
+            0,
+            None,
+            "-ngl 99 --device=0 --gpu-layers 88 -c 2048",
+        )
+        .unwrap();
+        let layers = args.iter().position(|a| a == "-ngl").unwrap();
+        assert_eq!(args[layers + 1], "0");
+        assert!(!args.iter().any(|a| a == "--device"));
+        assert!(!args.iter().any(|a| a == "99" || a == "88"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "-c" && pair[1] == "2048"));
     }
 
     #[test]

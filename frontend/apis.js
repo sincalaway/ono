@@ -48,7 +48,10 @@ const STD_PARAMS = ['temperature', 'top_p', 'max_tokens', 'presence_penalty', 'f
 /** 发起一次对话请求，返回和 fetch 一样的对象（ok / status / text() / body.getReader()） */
 async function llmFetch(body, signal) {
   if (!usingApi()) {
-    return fetch(`http://127.0.0.1:${S.server.port}/v1/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal, body: JSON.stringify(body) });
+    const port = Number(S.server.port);
+    if (!S.server.running || !S.server.ready) throw new Error('本地模型还没有就绪，请在「运行」页启动模型，或在顶部切换到第三方 API');
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('本地模型端口无效，请重新启动模型');
+    return fetch(`http://127.0.0.1:${port}/v1/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal, body: JSON.stringify(body) });
   }
   const b = { messages: body.messages, stream: true };
   if (body.tools) b.tools = body.tools;
@@ -267,10 +270,10 @@ Object.assign(actions, {
     S.run.ctx = null;
     S.run.quickName = m.name;
     toast(`正在加载 ${m.name}…`);
-    await actions.startModel();
+    const started = await actions.startModel();
     S.run.quickName = '';
-    if (S.run.error) {
-      toast(`加载失败：${S.run.error.split('\n')[0]}`, 6000);
+    if (!started) {
+      if (S.run.error) toast('模型加载失败，完整原因已显示在运行页', 6000);
       return go('run');
     }
     render();

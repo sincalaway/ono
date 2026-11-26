@@ -316,6 +316,7 @@ function actualHtml(a) {
   const parts = [];
   if (a.gpu_layers != null) parts.push(`显卡上 ${a.gpu_layers}/${a.total_layers} 层`);
   if (a.ctx) parts.push(`上下文 ${a.ctx >= 1024 ? Math.round(a.ctx / 1024) + 'K' : a.ctx}`);
+  if (a.cpu) parts.push(S.settings?.engine_cpu ? 'CPU 模式' : '本次临时使用 CPU');
   if (a.auto_fit) parts.push('按实际空闲显存自动分配');
   if (a.safe_level) parts.push(`兼容模式 ${a.safe_level}（${['', 'KV 缓存不量化', 'KV 缓存不量化 + 关闭 Flash Attention', 'KV 缓存不量化 + 关闭 Flash Attention 和 CUDA Graphs', '在第 3 级基础上不加载看图组件', '再改用 cuBLAS 计算、调小批次'][a.safe_level] || ''}）`);
   if (!a.vision && S.local?.find((m) => m.path === S.run.path)?.mmproj) parts.push('未带看图组件');
@@ -361,7 +362,7 @@ function loadHtml() {
   return `<div class="head"><div class="stack" style="gap:3px"><b>正在启动 ${esc(S.server.model_name || (S.local || []).find((m) => m.path === S.run.path)?.name || '')}</b><span class="muted" style="font-size:12px">${esc(stage)}${running ? ` · 已用 ${fmtDur(L.elapsed_s)}` : ''}</span></div>${pct != null ? `<span class="pct">${pct}%</span>` : ''}</div>
     <div class="steps">${steps}</div>
     ${detail ? `<div class="muted mono" style="font-size:12px">${detail}</div>` : ''}
-    ${running && L.last_log ? `<div class="lastlog" title="引擎最新日志">${esc(L.last_log)}</div>` : ''}
+    ${running && L.last_log ? `<div class="lastlog" data-noi18n title="引擎最新日志">${esc(L.last_log)}</div>` : ''}
     ${hints.map((h) => `<div class="hint" style="font-size:12px;color:var(--clay-ink);line-height:1.6;margin-top:6px">${esc(h)}</div>`).join('')}`;
 }
 
@@ -570,11 +571,21 @@ function engineCard() {
 function runErrorHtml(err) {
   const crash = err.startsWith('ENGINE_CRASH|');
   const text = crash ? err.slice('ENGINE_CRASH|'.length) : err;
+  const loadFailed = /加载模型失败|引擎加载超时/.test(text);
   const amd = /amd|radeon/i.test(S.hw?.gpus?.[S.hw.primary_gpu ?? 0]?.name || '');
-  const btns = crash && !S.settings?.engine_cpu
-    ? `<div class="row" style="margin-top:10px">${dlSlot('engine', '<button class="btn primary sm" data-act="useCpuEngine">改用 CPU 版引擎</button>')}<button class="btn sm" data-act="extLink" data-url="${amd ? 'https://www.amd.com/zh-cn/support/download/drivers.html' : 'https://www.nvidia.cn/drivers/'}">下载最新显卡驱动</button></div>`
+  const engineBtn = crash && !S.settings?.engine_cpu
+    ? dlSlot('engine', '<button class="btn primary sm" data-act="useCpuEngine">改用 CPU 版引擎</button>')
     : '';
-  return `<div class="alert">${esc(text)}${btns}</div>`;
+  const cpuRetry = loadFailed && !S.run.actual?.cpu
+    ? '<button class="btn primary sm" data-act="retryModelCpu">本次改用 CPU 重试</button>'
+    : '';
+  const driverBtn = crash
+    ? `<button class="btn sm" data-act="extLink" data-url="${amd ? 'https://www.amd.com/zh-cn/support/download/drivers.html' : 'https://www.nvidia.cn/drivers/'}">下载最新显卡驱动</button>`
+    : '';
+  const btns = engineBtn || cpuRetry || driverBtn
+    ? `<div class="row" style="margin-top:10px">${cpuRetry}${engineBtn}${driverBtn}</div>`
+    : '';
+  return `<div class="alert"><div data-noi18n>${esc(text)}</div>${btns}</div>`;
 }
 
 // 启动命令里可以改的部分（去掉程序名、模型路径、看图组件、地址、端口，这些由软件管理）
@@ -1482,26 +1493,72 @@ const actions = {
     r.adopting = false;
     render();
   },
+  retryModelCpu: async () => {
+    if (!S.run.path) return toast('先选择一个模型');
+    if (S.streaming) return toast('正在回答，等它说完或先点停止再重试');
+    toast('正在本次改用 CPU 重新加载，不会修改默认设置', 6000);
+    await actions.startModel({ cpu: true });
+  },
   startModel: async (opts = {}) => {
     const r = S.run;
+    if (r.starting) return false;
+    if (S.streaming) {
+      toast('正在回答，等它说完或先点停止再切换模型');
+      return false;
+    }
+    if (!r.path) {
+      r.error = '请先选择一个模型';
+      render();
+      return false;
+    }
     const safe = typeof opts.safe === 'number' ? opts.safe : null;
     r.starting = true;
     r.error = '';
     r.load = null;
     r.note = '';
     r.actual = null;
+    S.crash = null;
     S.vision = {};
     S.logs = [];
+    S.server = {
+      ...S.server,
+      running: true,
+      ready: false,
+      model_path: r.path,
+      model_name: (S.local || []).find((m) => m.path === r.path)?.name || modelLabel(r.path.split(/[\\/]/).pop().replace(/\.[^.]+$/, ''), '本地模型'),
+    };
     render();
+    let ok = false;
     try {
-      r.actual = await call('start_model', { path: r.path, ctx: r.ctx || null, safe });
-      toast('模型已就绪，可以开始对话了');
+      r.actual = await invoke('start_model', { path: r.path, ctx: r.ctx || null, safe, cpu: opts.cpu === true });
+      ok = true;
+      if (!opts.stay && !S.autoRecovering) toast('模型已就绪，可以开始对话了');
     } catch (e) {
       r.error = typeof e === 'string' ? e : String(e);
+      r.logsOpen = true;
+    } finally {
+      r.starting = false;
+      try {
+        S.server = normalizeServerStatus(await invoke('server_status'));
+      } catch (e) {
+        S.server = { ...S.server, running: false, ready: false };
+        if (!r.error) r.error = `模型已启动，但读取运行状态失败：${String(e)}`;
+        r.logsOpen = true;
+        ok = false;
+      }
+      if (ok && !S.server.ready) {
+        r.error = '引擎已返回启动结果，但模型服务仍未就绪。请查看运行日志后重试。';
+        r.logsOpen = true;
+        ok = false;
+      }
+      render();
+      if (r.error) {
+        r.logsOpen = true;
+        const logs = document.querySelector('#main details[data-open="logsOpen"]');
+        if (logs) logs.open = true;
+      }
     }
-    r.starting = false;
-    S.server = normalizeServerStatus(await invoke('server_status'));
-    render();
+    return ok && !!S.server.ready;
   },
   stopModel: async () => {
     await call('stop_model');

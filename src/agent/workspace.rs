@@ -441,8 +441,20 @@ pub(super) fn run(ws: &Path, name: &str, a: &Value) -> Reply {
             let s = fs::read_to_string(&path).map_err(err)?;
             let old = arg(a, "old_text")?;
             let new = arg(a, "new_text")?;
-            if old.is_empty() || !s.contains(old) {
-                return Err("未找到原文".into());
+            if old.is_empty() {
+                return Err(
+                    "old_text 不能为空。请先 read_file 查看当前内容，再提供要替换的原文。".into(),
+                );
+            }
+            if !s.contains(old) {
+                let preview = s.lines().take(12).collect::<Vec<_>>().join("\n");
+                return Err(format!(
+                    "未找到原文：{}（{} 行）。old_text 必须与当前文件完全一致，包括空格、缩进和换行。请先调用 read_file 重新读取，从带行号的当前内容中逐字复制 old_text，不要猜测或重复相同调用。\n文件开头：\n{}",
+                    path.display(),
+                    s.lines().count(),
+                    preview
+                )
+                .into());
             }
             if !a["replace_all"].as_bool().unwrap_or(false) && s.matches(old).count() != 1 {
                 return Err("原文出现多次，请增加上下文".into());
@@ -507,6 +519,39 @@ mod tests {
         let archive =
             zip::ZipArchive::new(fs::File::open(root.join("delivery.zip")).unwrap()).unwrap();
         assert!(archive.file_names().any(|name| name == "src/a.txt"));
+    }
+
+    #[test]
+    fn list_files_keeps_the_first_sorted_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for path in ["index.html", "script.js", "style.css"] {
+            run(root, "write_file", &json!({"path":path,"content":"x"})).unwrap();
+        }
+        let tree = run(root, "list_files", &json!({"path":".","depth":1})).unwrap();
+        assert_eq!(tree, "index.html\nscript.js\nstyle.css");
+    }
+
+    #[test]
+    fn missing_edit_text_explains_how_to_recover() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        run(
+            root,
+            "write_file",
+            &json!({"path":"index.html","content":"<h1>ono</h1>"}),
+        )
+        .unwrap();
+        let error = run(
+            root,
+            "edit_file",
+            &json!({"path":"index.html","old_text":"missing","new_text":"x"}),
+        )
+        .unwrap_err();
+        assert!(error.contains("未找到原文"));
+        assert!(error.contains("read_file"));
+        assert!(error.contains("index.html"));
+        assert!(error.contains("<h1>ono</h1>"));
     }
 
     #[test]
