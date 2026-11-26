@@ -33,9 +33,9 @@ function srcReady() {
   return !!apiOf(S.src.id).key;
 }
 function srcName() {
-  if (!usingApi()) return S.server.running ? S.server.model_name : '本地模型';
+  if (!usingApi()) return S.server.running ? modelLabel(S.server.model_name, '本地模型') : '本地模型';
   const a = apiOf(S.src.id);
-  return `${a.name} · ${S.src.model || a.model}`;
+  return `${modelLabel(a.name, '第三方 API')} · ${modelLabel(S.src.model || a.model, '未选模型')}`;
 }
 
 // ------------------------------------------------------------------ 请求：本地 llama-server 或第三方 API
@@ -138,7 +138,7 @@ function srcButton() {
   const api = usingApi();
   const sv = S.server;
   const dot = api ? '<span class="pulse live" style="background:#5B8DEF"></span>' : `<span class="pulse ${sv.ready ? 'live' : ''}" ${sv.running ? '' : 'style="background:#B5AFA1"'}></span>`;
-  const label = api ? esc(srcName()) : S.run.starting && S.run.quickName ? `正在加载 ${esc(S.run.quickName)}…` : sv.running ? `${esc(sv.model_name)}${sv.ready ? '' : '（加载中）'}` : S.pausedChat ? '对话模型已暂停（显存让给了画图）' : '本地模型：还没有启动';
+  const label = api ? esc(srcName()) : S.run.starting && S.run.quickName ? `正在加载 ${esc(S.run.quickName)}…` : sv.running ? `${esc(modelLabel(sv.model_name, '本地模型'))}${sv.ready ? '' : '（加载中）'}` : S.pausedChat ? '对话模型已暂停（显存让给了画图）' : '本地模型：还没有启动';
   return `<div class="src-wrap"><button class="btn src-btn" data-act="toggleSrcMenu" aria-expanded="${S.srcMenu}" title="切换模型：点一下就加载">${dot}${label}<span class="caret">▾</span></button>${S.srcMenu ? srcMenuHtml() : ''}</div>`;
 }
 function srcMenuHtml() {

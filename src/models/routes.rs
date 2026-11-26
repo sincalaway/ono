@@ -52,7 +52,7 @@ impl Route {
             return Err("镜像地址必须是 HTTP 或 HTTPS 基地址".into());
         }
         let client = Client::builder()
-            .user_agent("ono/3.1.1")
+            .user_agent(concat!("ono/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(12))
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -172,8 +172,7 @@ impl Routes {
         if status == StatusCode::PARTIAL_CONTENT && range.is_none() {
             return Err("服务器返回了未请求的分段".into());
         }
-        if status.is_success() || (range.is_some() && status == StatusCode::RANGE_NOT_SATISFIABLE)
-        {
+        if status.is_success() || (range.is_some() && status == StatusCode::RANGE_NOT_SATISFIABLE) {
             return Ok((
                 response,
                 if route.endpoint.origin().ascii_serialization() == HF {

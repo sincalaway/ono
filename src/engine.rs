@@ -208,11 +208,18 @@ fn install(ctx: &Ctx, app: &AppHandle, force: bool) -> Reply {
     }
     install_archive(ctx, archive.path(), url.ends_with(".zip"), tag, variant)
 }
+fn model_name(path: &str) -> String {
+    Path::new(path)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_owned()
+}
 fn status(s: &Service) -> Value {
     match s.running.as_ref() {
         None => json!({"running":false,"ready":false}),
         Some(r) => {
-            json!({"running":true,"ready":r.ready,"model_path":r.path,"model_name":Path::new(&r.path).file_stem(),"port":r.port})
+            json!({"running":true,"ready":r.ready,"model_path":r.path,"model_name":model_name(&r.path),"port":r.port})
         }
     }
 }
@@ -394,6 +401,7 @@ fn start(ctx: &Ctx, app: &AppHandle, a: &Value) -> Reply {
         .find(|n| TcpListener::bind(("127.0.0.1", *n)).is_ok())
         .ok_or("没有可用端口")?;
     let mut cmd = Command::new(exe);
+    crate::hide_console_window(&mut cmd);
     let mm = model["mmproj"]
         .as_str()
         .filter(|p| !p.is_empty() && level < 4);
@@ -484,7 +492,9 @@ fn start(ctx: &Ctx, app: &AppHandle, a: &Value) -> Reply {
 }
 fn check_engine(ctx: &Ctx) -> Reply {
     let exe = executable(ctx).ok_or("未检测到引擎")?;
-    let output = Command::new(exe)
+    let mut command = Command::new(exe);
+    crate::hide_console_window(&mut command);
+    let output = command
         .arg("--list-devices")
         .output()
         .map_err(|e| e.to_string())?;
@@ -566,6 +576,13 @@ pub fn handle(cmd: &str, a: &Value, ctx: &Ctx, app: &AppHandle) -> Option<Reply>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn status_serializes_model_name_as_text() {
+        let value = json!({"model_name": model_name(r"C:\models\Qwen3-4B-Q4_K_M.gguf")});
+        assert_eq!(value["model_name"], "Qwen3-4B-Q4_K_M");
+        assert!(value["model_name"].is_string());
+    }
+
     #[test]
     fn engine_manages_port_model_and_vision_once() {
         let args = launch_args(

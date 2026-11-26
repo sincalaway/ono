@@ -12,9 +12,11 @@ use tauri::{Listener, Manager};
 fn main() {
     let dir = tempfile::tempdir().unwrap();
     env::set_var("ONO_DATA_DIR", dir.path());
-    let app = ono::builder()
-        .build(tauri::generate_context!())
-        .unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    std::fs::write(workspace.join("existing.txt"), "existing").unwrap();
+    env::set_var("ONO_TEST_WORKSPACE", &workspace);
+    let app = ono::builder().build(tauri::generate_context!()).unwrap();
     let done = Arc::new(AtomicBool::new(false));
     let handle = app.handle().clone();
     let finished = done.clone();
@@ -39,7 +41,10 @@ fn main() {
                 return;
             }
             let fixture = serde_json::to_string(&env::var("ONO_TEST_GGUF").ok()).unwrap();
-            let js = include_str!("desktop.js").replace("__MODEL_FIXTURE__", &fixture);
+            let workspace = serde_json::to_string(&env::var("ONO_TEST_WORKSPACE").ok()).unwrap();
+            let js = include_str!("desktop.js")
+                .replace("__MODEL_FIXTURE__", &fixture)
+                .replace("__WORKSPACE_FIXTURE__", &workspace);
             win.eval(&js).unwrap();
             std::thread::sleep(Duration::from_secs(2));
         }

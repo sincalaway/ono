@@ -5,6 +5,21 @@ const { listen } = window.__TAURI__.event;
 const GB = 1024 ** 3;
 const $ = (s, r = document) => r.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const modelLabel = (value, fallback = '') => {
+  if (typeof value === 'string' && value.trim()) return value;
+  if (value && typeof value === 'object') {
+    for (const key of ['name', 'id', 'label', 'model']) {
+      if (typeof value[key] === 'string' && value[key].trim()) return value[key];
+    }
+  }
+  return fallback;
+};
+const normalizeServerStatus = (status) => {
+  if (!status || typeof status !== 'object') return status;
+  const path = typeof status.model_path === 'string' ? status.model_path : '';
+  const file = path.split(/[\\/]/).pop().replace(/\.[^.]+$/, '');
+  return { ...status, model_name: modelLabel(status.model_name, file || '本地模型') };
+};
 const fmtGB = (b) => {
   const g = (b || 0) / GB;
   return (g >= 100 ? g.toFixed(0) : g.toFixed(1)) + ' GB';
@@ -1485,12 +1500,12 @@ const actions = {
       r.error = typeof e === 'string' ? e : String(e);
     }
     r.starting = false;
-    S.server = await invoke('server_status');
+    S.server = normalizeServerStatus(await invoke('server_status'));
     render();
   },
   stopModel: async () => {
     await call('stop_model');
-    S.server = await invoke('server_status');
+    S.server = normalizeServerStatus(await invoke('server_status'));
     render();
   },
   copyApi: () => {
@@ -1828,9 +1843,9 @@ listen('net-status', (e) => {
   S.net = e.payload;
 });
 listen('server-status', (e) => {
-  S.server = e.payload;
+  S.server = normalizeServerStatus(e.payload);
   renderSide();
-  if (S.page === 'run' || S.page === 'chat') render();
+  if (S.page === 'run' || S.page === 'chat' || S.page === 'agent') render();
 });
 
 // 加载中每秒刷新一次进度（只更新进度框，不整页重绘）
@@ -1847,7 +1862,7 @@ setInterval(async () => {
 // 模型运行中崩溃：显卡计算出错时自动降一级兼容模式重启，并重新回答；否则在对话页顶部说明原因
 listen('server-crashed', async (e) => {
   let info = e.payload;
-  try { S.server = await invoke('server_status'); } catch {}
+  try { S.server = normalizeServerStatus(await invoke('server_status')); } catch {}
   const level = S.run.actual?.safe_level ?? 0;
   if (info.gpu_error && level < 5 && info.model_path) {
     S.autoRecovering = true;
@@ -1936,7 +1951,7 @@ setInterval(async () => {
   try {
     S.settings = await invoke('get_settings');
     try { S.version = await window.__TAURI__.app.getVersion(); } catch {}
-    S.server = await invoke('server_status');
+    S.server = normalizeServerStatus(await invoke('server_status'));
   } catch {}
   renderSide();
   await loadOverview(false).catch(() => {});

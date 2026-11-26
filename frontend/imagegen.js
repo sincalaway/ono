@@ -687,7 +687,7 @@ Object.assign(actions, {
         S.img.busy = 'loading';
         render();
         S.img.status = await call('start_image', { id, quant });
-        S.server = await invoke('server_status');
+        S.server = normalizeServerStatus(await invoke('server_status'));
       }
       S.img.busy = 'generating';
       S.img.t0 = Date.now();
@@ -1051,7 +1051,7 @@ async function sendMediaMessage(kind, text) {
       S.img.t0 = Date.now();
       chatJobRefresh();
       S.img.status = await invoke('start_image', { id: m.id, quant: pick.q.quant });
-      S.server = await invoke('server_status');
+      S.server = normalizeServerStatus(await invoke('server_status'));
     }
     if (aborted()) throw new DOMException('aborted', 'AbortError');
     // 3. 生成
@@ -1086,7 +1086,7 @@ async function sendMediaMessage(kind, text) {
     S.img.progress = null;
     S.img.chatJob = null;
     S.img.status = await invoke('image_status').catch(() => ({}));
-    S.server = await invoke('server_status').catch(() => S.server);
+    S.server = normalizeServerStatus(await invoke('server_status').catch(() => S.server));
     ai.done = true;
     S.streaming = false;
     S.abort = null;

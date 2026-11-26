@@ -199,7 +199,7 @@
         S.img.busy = 'loading';
         render();
         S.img.status = await call('start_image', { id, quant });
-        S.server = await invoke('server_status');
+        S.server = normalizeServerStatus(await invoke('server_status'));
       }
       // 参考图：第一张决定画面比例；改图模型其余几张也一起送进去
       let [, w, h] = IMG_SIZES.find((x) => x[0] === f.size) || IMG_SIZES[0];

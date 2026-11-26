@@ -180,6 +180,11 @@ const agentSchemas = (skills = []) =>
   }));
 const PATH_TOOLS = ['list_files', 'read_file', 'write_file', 'edit_file', 'make_dir', 'delete_path', 'search_files', 'knowledge_base_query', 'package_files'];
 const WRITE_TOOLS = ['write_file', 'edit_file', 'make_dir', 'delete_path', 'package_files'];
+const agentMutationKey = (name, a = {}) => {
+  const path = name === 'package_files' ? a.output_path : a.path;
+  const normalized = String(path || '').replace(/\\/g, '/').replace(/^\.\//, '');
+  return `${name}:${OS_NAME === 'Windows' ? normalized.toLowerCase() : normalized}`;
+};
 
 function agentSystem(t, skills = []) {
   const enabled = skills.filter((s) => s.enabled);
@@ -424,6 +429,7 @@ async function runAgent(t) {
   const update = (i) => { if (S.page === 'agent' && S.ag.id === t.id) updateStreamingMessage(i); };
   const refreshSide = () => { if (S.page === 'agent' && S.ag.id === t.id) { const el = document.getElementById('agSide'); if (el) el.innerHTML = agentSideHtml(t); } };
   let rounds = 0;
+  const failedMutations = new Map();
   // 实时状态：模型在想、在写哪个文件（显示已生成多少）、在执行哪一步；每秒刷新一次用时
   const live = (x) => {
     const c = x.call;
@@ -467,19 +473,23 @@ async function runAgent(t) {
         if (bad) {
           out = `错误：${bad}`;
           step.status = 'error';
+          if (WRITE_TOOLS.includes(c.name)) failedMutations.set(agentMutationKey(c.name, a), step.label);
         } else {
           try {
             const res = await agentExec(t, c.name, a, abort.signal);
             if (res && res.denied) {
               out = res.text;
               step.status = 'denied';
+              if (WRITE_TOOLS.includes(c.name)) failedMutations.set(agentMutationKey(c.name, a), step.label);
             } else {
               out = String(res);
               step.status = 'done';
+              if (WRITE_TOOLS.includes(c.name)) failedMutations.delete(agentMutationKey(c.name, a));
             }
           } catch (e) {
             out = `错误：${typeof e === 'string' ? e : e.message || e}`;
             step.status = 'error';
+            if (WRITE_TOOLS.includes(c.name)) failedMutations.set(agentMutationKey(c.name, a), step.label);
           }
         }
         step.result = out.slice(0, 4000);
@@ -488,7 +498,13 @@ async function runAgent(t) {
         refreshSide();
       }
     }
-    t.status = t.status === 'paused' ? 'paused' : 'done';
+    const failed = [...new Set(failedMutations.values())];
+    if (failed.length) {
+      t.status = 'error';
+      ai.content += `\n\n> 任务未完成：${failed.join('、')} 未成功。请修正错误后重试。`;
+    } else {
+      t.status = t.status === 'paused' ? 'paused' : 'done';
+    }
   } catch (e) {
     t.status = 'stopped';
     if (e.name === 'AbortError') {
@@ -512,7 +528,7 @@ async function runAgent(t) {
     S.ag.tree = '';
     saveTasks();
     if (S.page === 'agent') render();
-    else toast(`Agent 任务「${t.title}」${t.status === 'done' ? '完成了' : '已停止'}`, 4000);
+    else toast(`Agent 任务「${t.title}」${t.status === 'done' ? '完成了' : t.status === 'error' ? '未完成' : '已停止'}`, 4000);
     agentScroll();
   }
 }

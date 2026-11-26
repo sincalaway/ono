@@ -17,6 +17,16 @@ use tauri::{AppHandle, Manager};
 pub type Reply = Result<Value, String>;
 static START: Mutex<()> = Mutex::new(());
 
+#[cfg(windows)]
+pub fn hide_console_window(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+pub fn hide_console_window(_command: &mut std::process::Command) {}
+
 fn autostart(cmd: &str, on: bool) -> Reply {
     let exe = env::current_exe().map_err(|e| e.to_string())?;
     let launcher = auto_launch::AutoLaunchBuilder::new()

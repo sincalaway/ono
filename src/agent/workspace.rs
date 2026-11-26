@@ -20,6 +20,8 @@ fn physical(path: &Path) -> Result<PathBuf, String> {
                 out.pop();
             }
             Component::CurDir => {}
+            // A Windows verbatim prefix like \\?\D: is not a complete path.
+            Component::Prefix(_) => out.push(part.as_os_str()),
             _ => {
                 out.push(part.as_os_str());
                 match fs::symlink_metadata(&out) {
@@ -91,9 +93,13 @@ fn terminate(child: &mut Child) {
         .args(["-KILL", &format!("-{}", child.id())])
         .output();
     #[cfg(windows)]
-    let _ = Command::new("taskkill")
-        .args(["/F", "/T", "/PID", &child.id().to_string()])
-        .output();
+    {
+        let mut command = Command::new("taskkill");
+        crate::hide_console_window(&mut command);
+        let _ = command
+            .args(["/F", "/T", "/PID", &child.id().to_string()])
+            .output();
+    }
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -176,7 +182,7 @@ fn supervise(root: &Path, mut cmd: Command, a: &Value) -> Reply {
 fn shell(root: &Path, a: &Value) -> Reply {
     let command = arg(a, "command")?;
     #[cfg(windows)]
-    let cmd = {
+    let mut cmd = {
         let mut c = Command::new("powershell.exe");
         c.args([
             "-NoProfile",
@@ -193,6 +199,7 @@ fn shell(root: &Path, a: &Value) -> Reply {
         c.args(["-c", command]).process_group(0);
         c
     };
+    crate::hide_console_window(&mut cmd);
     supervise(root, cmd, a)
 }
 fn code(root: &Path, a: &Value) -> Reply {
@@ -201,7 +208,7 @@ fn code(root: &Path, a: &Value) -> Reply {
     if source.chars().count() > 262_144 {
         return Err("代码不能超过 262144 字符".into());
     }
-    let cmd = match language.as_str() {
+    let mut cmd = match language.as_str() {
         "python" => {
             #[cfg(windows)]
             let mut cmd = {
@@ -236,6 +243,7 @@ fn code(root: &Path, a: &Value) -> Reply {
         }
         _ => return Err("仅支持 python、javascript、powershell 或 bash".into()),
     };
+    crate::hide_console_window(&mut cmd);
     supervise(root, cmd, a)
 }
 
@@ -466,6 +474,40 @@ pub(super) fn run(ws: &Path, name: &str, a: &Value) -> Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_workspace_dot_resolves() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        assert_eq!(physical(&root.join(".")).unwrap(), root);
+    }
+
+    #[test]
+    fn canonical_workspace_writes_and_packages_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        run(
+            &root,
+            "write_file",
+            &json!({"path":"src/a.txt","content":"alpha"}),
+        )
+        .unwrap();
+        assert!(run(
+            &root,
+            "write_file",
+            &json!({"path":"src","content":"not a file"})
+        )
+        .is_err());
+        run(
+            &root,
+            "package_files",
+            &json!({"path":".","output_path":"delivery.zip"}),
+        )
+        .unwrap();
+        let archive =
+            zip::ZipArchive::new(fs::File::open(root.join("delivery.zip")).unwrap()).unwrap();
+        assert!(archive.file_names().any(|name| name == "src/a.txt"));
+    }
 
     #[test]
     fn edits_require_unique_matches_and_preserve_other_content() {

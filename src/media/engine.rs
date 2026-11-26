@@ -87,6 +87,7 @@ fn start(ctx: &Ctx, a: &Value) -> Reply {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(err)?;
     let port = listener.local_addr().map_err(err)?.port();
     let mut cmd = Command::new(bin);
+    crate::hide_console_window(&mut cmd);
     cmd.current_dir(bin.parent().ok_or("引擎路径无效")?).args([
         "--listen-ip",
         "127.0.0.1",
