@@ -3,6 +3,7 @@ mod engine;
 mod hardware;
 mod media;
 mod models;
+mod skills;
 mod state;
 
 use serde_json::{json, Value};
@@ -55,6 +56,7 @@ fn dispatch(cmd: &str, a: &Value, ctx: &Ctx, app: &AppHandle) -> Reply {
         models::handle,
         media::handle,
         agent::handle,
+        skills::handle,
     ] {
         if let Some(reply) = module(cmd, a, ctx, app) {
             return reply;

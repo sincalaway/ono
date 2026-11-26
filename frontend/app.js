@@ -975,11 +975,13 @@ function modalHtml() {
     body = chatCfgHtml(m);
   } else if (m.step === 'vision') {
     body = visionHtml(m);
+  } else if (m.step === 'skills') {
+    body = skillsHtml(m);
   } else {
     return '';
   }
   const wide = m.step === 'chatcfg' || m.wide;
-  return `<div class="modal-bg" data-act="modalBg"><div class="modal${wide ? ' wide' : ''}" role="dialog" aria-modal="true">${body}</div></div>`;
+  return `<div class="modal-bg" data-act="modalBg"><div class="modal${wide ? ' wide' : ''}${m.step === 'skills' ? ' skill-modal' : ''}" role="dialog" aria-modal="true">${body}</div></div>`;
 }
 
 // ------------------------------------------------------------------ 对话设置：自定义系统提示词 + 模型参数

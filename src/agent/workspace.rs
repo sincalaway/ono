@@ -2,13 +2,14 @@ use super::{arg, err, files, Reply};
 use serde_json::{json, Value};
 use std::{
     fs,
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
+use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
 
 // Resolve symlinks before processing "..", including when only a path prefix exists.
 fn physical(path: &Path) -> Result<PathBuf, String> {
@@ -77,8 +78,13 @@ fn walk(
     }
     Ok(())
 }
+struct ShellProcess {
+    child: Child,
+    task_id: String,
+}
+
 // None prevents queued IPC workers from spawning a process during shutdown.
-static SHELLS: Mutex<Option<Vec<Child>>> = Mutex::new(Some(Vec::new()));
+static SHELLS: Mutex<Option<Vec<ShellProcess>>> = Mutex::new(Some(Vec::new()));
 fn terminate(child: &mut Child) {
     #[cfg(unix)]
     let _ = Command::new("/bin/kill")
@@ -93,15 +99,84 @@ fn terminate(child: &mut Child) {
 }
 pub fn shutdown() {
     if let Some(mut children) = SHELLS.lock().unwrap().take() {
-        for child in &mut children {
-            terminate(child);
+        for process in &mut children {
+            terminate(&mut process.child);
         }
     }
+}
+pub fn abort(task_id: &str) -> Reply {
+    let mut stopped = 0;
+    let mut guard = SHELLS.lock().map_err(err)?;
+    if let Some(children) = guard.as_mut() {
+        let mut index = 0;
+        while index < children.len() {
+            if children[index].task_id == task_id {
+                terminate(&mut children.remove(index).child);
+                stopped += 1;
+            } else {
+                index += 1;
+            }
+        }
+    }
+    Ok(json!(stopped))
+}
+fn supervise(root: &Path, mut cmd: Command, a: &Value) -> Reply {
+    let mut log = tempfile::tempfile().map_err(err)?;
+    let task_id = a["taskId"].as_str().unwrap_or("").to_owned();
+    let id = {
+        let mut guard = SHELLS.lock().map_err(err)?;
+        let children = guard.as_mut().ok_or("应用正在退出")?;
+        let child = cmd
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().map_err(err)?)
+            .stderr(log.try_clone().map_err(err)?)
+            .spawn()
+            .map_err(err)?;
+        let id = child.id();
+        children.push(ShellProcess { child, task_id });
+        id
+    };
+    let until =
+        Instant::now() + Duration::from_secs(a["timeout"].as_u64().unwrap_or(120).clamp(1, 600));
+    let status = loop {
+        {
+            let mut guard = SHELLS.lock().map_err(err)?;
+            let children = guard.as_mut().ok_or("应用正在退出")?;
+            let pos = children
+                .iter()
+                .position(|process| process.child.id() == id)
+                .ok_or("命令已停止")?;
+            match children[pos].child.try_wait() {
+                Ok(Some(status)) => {
+                    children.swap_remove(pos);
+                    break status.to_string();
+                }
+                Ok(None) if Instant::now() >= until => {
+                    terminate(&mut children.swap_remove(pos).child);
+                    break "命令超时".into();
+                }
+                Err(e) => {
+                    terminate(&mut children.swap_remove(pos).child);
+                    return Err(err(e));
+                }
+                _ => {}
+            }
+        }
+        thread::sleep(Duration::from_millis(40));
+    };
+    log.seek(SeekFrom::Start(0)).map_err(err)?;
+    let mut bytes = Vec::new();
+    log.take(65536).read_to_end(&mut bytes).map_err(err)?;
+    Ok(json!(format!(
+        "{status}\n{}",
+        String::from_utf8_lossy(&bytes)
+    )))
 }
 fn shell(root: &Path, a: &Value) -> Reply {
     let command = arg(a, "command")?;
     #[cfg(windows)]
-    let mut cmd = {
+    let cmd = {
         let mut c = Command::new("powershell.exe");
         c.args([
             "-NoProfile",
@@ -118,56 +193,140 @@ fn shell(root: &Path, a: &Value) -> Reply {
         c.args(["-c", command]).process_group(0);
         c
     };
-    let mut log = tempfile::tempfile().map_err(err)?;
-    let id = {
-        let mut guard = SHELLS.lock().map_err(err)?;
-        let children = guard.as_mut().ok_or("应用正在退出")?;
-        let child = cmd
-            .current_dir(root)
-            .stdin(Stdio::null())
-            .stdout(log.try_clone().map_err(err)?)
-            .stderr(log.try_clone().map_err(err)?)
-            .spawn()
-            .map_err(err)?;
-        let id = child.id();
-        children.push(child);
-        id
+    supervise(root, cmd, a)
+}
+fn code(root: &Path, a: &Value) -> Reply {
+    let language = arg(a, "language")?.trim().to_ascii_lowercase();
+    let source = arg(a, "code")?;
+    if source.chars().count() > 262_144 {
+        return Err("代码不能超过 262144 字符".into());
+    }
+    let cmd = match language.as_str() {
+        "python" => {
+            #[cfg(windows)]
+            let mut cmd = {
+                let mut cmd = Command::new("py");
+                cmd.args(["-3", "-u"]);
+                cmd
+            };
+            #[cfg(not(windows))]
+            let mut cmd = Command::new("python3");
+            cmd.args(["-c", source]);
+            cmd
+        }
+        "javascript" | "node" => {
+            let mut cmd = Command::new("node");
+            cmd.args(["-e", source]);
+            cmd
+        }
+        "powershell" => {
+            let mut cmd = Command::new("powershell.exe");
+            cmd.args(["-NoProfile", "-NonInteractive", "-Command", source]);
+            cmd
+        }
+        "bash" | "sh" => {
+            let mut cmd = Command::new("sh");
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                cmd.process_group(0);
+            }
+            cmd.args(["-c", source]);
+            cmd
+        }
+        _ => return Err("仅支持 python、javascript、powershell 或 bash".into()),
     };
-    let until =
-        Instant::now() + Duration::from_secs(a["timeout"].as_u64().unwrap_or(120).clamp(1, 600));
-    let status = loop {
-        {
-            let mut guard = SHELLS.lock().map_err(err)?;
-            let children = guard.as_mut().ok_or("应用正在退出")?;
-            let pos = children
-                .iter()
-                .position(|c| c.id() == id)
-                .ok_or("命令已停止")?;
-            match children[pos].try_wait() {
-                Ok(Some(status)) => {
-                    children.swap_remove(pos);
-                    break status.to_string();
-                }
-                Ok(None) if Instant::now() >= until => {
-                    terminate(&mut children.swap_remove(pos));
-                    break "命令超时".into();
-                }
-                Err(e) => {
-                    terminate(&mut children.swap_remove(pos));
-                    return Err(err(e));
-                }
-                _ => {}
+    supervise(root, cmd, a)
+}
+
+const MAX_PACKAGE_FILE: u64 = 32 * 1024 * 1024;
+const MAX_PACKAGE_TOTAL: u64 = 128 * 1024 * 1024;
+const MAX_PACKAGE_ENTRIES: usize = 1000;
+
+fn package(root: &Path, a: &Value) -> Reply {
+    let raw = root.join(arg(a, "path")?);
+    if fs::symlink_metadata(&raw)
+        .map_err(err)?
+        .file_type()
+        .is_symlink()
+    {
+        return Err("不能打包符号链接".into());
+    }
+    let path = physical(&raw)?;
+    if !path.starts_with(root) {
+        return Err("只能打包工作文件夹里的内容".into());
+    }
+    let output_raw = root.join(arg(a, "output_path")?);
+    if output_raw
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        return Err("打包目标不能是符号链接".into());
+    }
+    let output = physical(&output_raw)?;
+    if !output.starts_with(root) {
+        return Err("打包文件必须保存在工作文件夹里".into());
+    }
+    if output == path || (path.is_dir() && output.starts_with(&path)) {
+        return Err("打包文件不能放在被打包的文件夹里面".into());
+    }
+    if output.is_dir() {
+        return Err("打包目标必须是文件".into());
+    }
+    let parent = output.parent().ok_or("打包目标没有上级文件夹")?;
+    fs::create_dir_all(parent).map_err(err)?;
+    let mut files = Vec::new();
+    let mut total = 0_u64;
+    let mut budget = MAX_PACKAGE_ENTRIES;
+    let mut visit = |file: &Path, ty: &fs::FileType| -> Result<(), String> {
+        if ty.is_symlink() {
+            return Err("打包内容不能包含符号链接".into());
+        }
+        if !ty.is_file() {
+            return Ok(());
+        }
+        let size = fs::metadata(file).map_err(err)?.len();
+        if size > MAX_PACKAGE_FILE {
+            return Err("打包中的单个文件超过 32 MiB".into());
+        }
+        total = total.checked_add(size).ok_or("打包内容过大")?;
+        if total > MAX_PACKAGE_TOTAL {
+            return Err("打包内容超过 128 MiB".into());
+        }
+        let relative = file.strip_prefix(root).map_err(err)?;
+        files.push((
+            file.to_path_buf(),
+            relative.to_string_lossy().replace('\\', "/"),
+        ));
+        Ok(())
+    };
+    if path.is_file() {
+        visit(&path, &fs::metadata(&path).map_err(err)?.file_type())?;
+    } else {
+        walk(&path, 128, &mut visit, &mut budget)?;
+    }
+    if files.len() > MAX_PACKAGE_ENTRIES {
+        return Err("打包内容超过 1000 个文件".into());
+    }
+    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(err)?;
+    {
+        let mut archive = ZipWriter::new(temp.as_file_mut());
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        for (file, name) in files {
+            let input = fs::File::open(file).map_err(err)?;
+            archive.start_file(name, options.clone()).map_err(err)?;
+            let copied =
+                std::io::copy(&mut input.take(MAX_PACKAGE_FILE + 1), &mut archive).map_err(err)?;
+            if copied > MAX_PACKAGE_FILE {
+                return Err("打包中的单个文件超过 32 MiB".into());
             }
         }
-        thread::sleep(Duration::from_millis(40));
-    };
-    log.seek(SeekFrom::Start(0)).map_err(err)?;
-    let mut bytes = Vec::new();
-    log.take(65536).read_to_end(&mut bytes).map_err(err)?;
-    Ok(json!(format!(
-        "{status}\n{}",
-        String::from_utf8_lossy(&bytes)
-    )))
+        archive.finish().map_err(err)?;
+    }
+    temp.flush().map_err(err)?;
+    temp.as_file().sync_all().map_err(err)?;
+    temp.persist(&output).map_err(err)?;
+    Ok(json!(format!("已打包 {}", output.display())))
 }
 
 pub(super) fn run(ws: &Path, name: &str, a: &Value) -> Reply {
@@ -175,9 +334,13 @@ pub(super) fn run(ws: &Path, name: &str, a: &Value) -> Reply {
     if name == "run_command" {
         return shell(&root, a);
     }
+    if name == "run_code" {
+        return code(&root, a);
+    }
     let raw = root.join(a["path"].as_str().unwrap_or("."));
     let path = physical(&raw)?;
     match name {
+        "package_files" => package(&root, a),
         "list_files" | "search_files" => {
             let search = name == "search_files";
             let depth = if search {
@@ -327,6 +490,53 @@ mod tests {
             .unwrap(),
             "2\tz\n3\ty"
         );
+    }
+
+    #[test]
+    fn packages_workspace_files_and_rejects_self_inclusion() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        run(
+            root,
+            "write_file",
+            &json!({"path":"src/a.txt","content":"alpha"}),
+        )
+        .unwrap();
+        run(
+            root,
+            "write_file",
+            &json!({"path":"README.md","content":"ono"}),
+        )
+        .unwrap();
+        run(
+            root,
+            "package_files",
+            &json!({"path":".","output_path":"delivery.zip"}),
+        )
+        .unwrap();
+        let archive =
+            zip::ZipArchive::new(fs::File::open(root.join("delivery.zip")).unwrap()).unwrap();
+        let names = archive.file_names().collect::<Vec<_>>();
+        assert!(names.contains(&"src/a.txt"));
+        assert!(names.contains(&"README.md"));
+        assert!(!names.contains(&"delivery.zip"));
+        assert!(run(
+            root,
+            "package_files",
+            &json!({"path":"src","output_path":"src/a.zip"})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_code_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(run(
+            temp.path(),
+            "run_code",
+            &json!({"language":"ruby","code":"puts 1"})
+        )
+        .is_err());
     }
 
     #[cfg(unix)]

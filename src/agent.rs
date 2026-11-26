@@ -1,6 +1,7 @@
 mod api;
 mod computer;
 mod files;
+mod memory;
 mod web;
 mod workspace;
 pub use workspace::shutdown;
@@ -22,6 +23,10 @@ pub fn handle(cmd: &str, a: &Value, ctx: &Ctx, app: &tauri::AppHandle) -> Option
             "agent_pick_folder" => Ok(json!(rfd::FileDialog::new().pick_folder())),
             "agent_resolve" => workspace::resolve(a),
             "agent_tool" => workspace::run(Path::new(arg(a, "ws")?), arg(a, "name")?, &a["args"]),
+            "agent_abort_task" => workspace::abort(arg(a, "taskId")?),
+            "memory_add" => memory::add(ctx, a),
+            "memory_search" => memory::search(ctx, a),
+            "memory_update" => memory::update(ctx, a),
             "tool_read_file" => Ok(json!(files::document(Path::new(arg(a, "path")?))?)),
             "tool_list_dir" | "tool_write_file" | "tool_run_command" => {
                 let cwd = std::env::current_dir().map_err(err)?;

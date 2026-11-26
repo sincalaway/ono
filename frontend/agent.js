@@ -216,6 +216,68 @@ function askConfirm({ title, body, detail, alwaysLabel, lang }) {
   });
 }
 
+function askUser(question, options = [], signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('aborted', 'AbortError'));
+      return;
+    }
+    let host = document.getElementById('agent-question-host');
+    if (!host) {
+      host = document.createElement('div');
+      host.id = 'agent-question-host';
+      document.body.appendChild(host);
+    }
+    const choices = Array.isArray(options) ? options.map((x) => String(x || '').trim()).filter(Boolean).slice(0, 8) : [];
+    host.innerHTML = `<div class="modal-bg"><div class="modal confirm" role="dialog" aria-modal="true" aria-labelledby="au-title">
+      <h2 id="au-title">Agent 需要你的回答</h2>
+      <p data-noi18n>${esc(String(question || ''))}</p>
+      ${choices.length ? `<div class="row" style="flex-wrap:wrap;justify-content:flex-start;margin:12px 0">${choices.map((choice, i) => `<button class="btn" data-noi18n data-au-choice="${i}">${esc(choice)}</button>`).join('')}</div>` : ''}
+      <form id="au-form"><label class="sr" for="au-answer">你的回答</label><textarea id="au-answer" rows="3" maxlength="4000" placeholder="输入回答，或点击上面的选项"></textarea>
+        <div class="row" style="justify-content:space-between;margin-top:14px"><button type="button" class="btn danger" id="au-stop">停止任务</button><button type="submit" class="btn primary">提交回答</button></div>
+      </form>
+    </div></div>`;
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      document.removeEventListener('keydown', onKey, true);
+      host.innerHTML = '';
+    };
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    };
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new DOMException('aborted', 'AbortError'));
+    };
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        done('用户暂未回答，请基于现有信息继续，或给出需要用户决定的事项。');
+      }
+    };
+    const timer = setTimeout(() => done('用户未在 5 分钟内回答，请基于现有信息继续，或给出需要用户决定的事项。'), 300000);
+    host.querySelectorAll('[data-au-choice]').forEach((button) => {
+      button.onclick = () => done(choices[Number(button.dataset.auChoice)]);
+    });
+    $('#au-form').onsubmit = (e) => {
+      e.preventDefault();
+      done($('#au-answer').value.trim() || '（用户未填写文字）');
+    };
+    $('#au-stop').onclick = onAbort;
+    document.addEventListener('keydown', onKey, true);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    $('#au-answer').focus();
+  });
+}
+
 async function confirmTool(chat, name, a) {
   const def = toolDef(name);
   if (!def?.confirm) return true;
