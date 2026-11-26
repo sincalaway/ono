@@ -52,7 +52,7 @@ impl Route {
             return Err("镜像地址必须是 HTTP 或 HTTPS 基地址".into());
         }
         let client = Client::builder()
-            .user_agent("ono/3.1.0")
+            .user_agent("ono/3.1.1")
             .connect_timeout(Duration::from_secs(12))
             .redirect(reqwest::redirect::Policy::none())
             .build()

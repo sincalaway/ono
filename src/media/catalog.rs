@@ -22,7 +22,7 @@ pub fn cancel_download(id: &str) {
 }
 pub(super) fn client() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
-        .user_agent("ono/3.1.0")
+        .user_agent("ono/3.1.1")
         .connect_timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(err)
